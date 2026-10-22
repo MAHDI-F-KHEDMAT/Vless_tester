@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VLESS (tls / reality) collector + TCP tester for Termux.
+VLESS (tls / reality) collector + TCP tester for Termux and GitHub Actions.
 
 مراحل:
  1) دانلود کانفیگ‌ها از منابع
  2) فیلتر: فقط vless با security=tls یا reality
  3) حذف تکراری‌ها
  4) تست TCP و حذف مرده‌ها
-    خروجی: tcp_alive.txt در پوشه Download (مرتب بر اساس پینگ)
+    خروجی: tcp_alive.txt (مرتب بر اساس پینگ)
+      - Termux: در پوشه Download
+      - GitHub Actions: در ریشه‌ی repo
 
 نصب در ترموکس:
     termux-setup-storage
@@ -104,6 +106,11 @@ def log(*a):
 
 # ----------------------------- مسیر خروجی -----------------------------
 def download_dir():
+    # GitHub Actions: توی ریشه‌ی repo (پوشه‌ی جاری) ذخیره کن
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        return os.getcwd()
+
+    # Termux
     for p in (os.path.expanduser("~/storage/downloads"),
               "/storage/emulated/0/Download",
               "/sdcard/Download"):
@@ -245,10 +252,11 @@ def main():
     with cf.ThreadPoolExecutor(TCP_WORKERS) as tp:
         list(tp.map(tcp_job, uniq))
 
-    # ذخیره نتایج (مرتب بر اساس پینگ)
+    # ذخیره نتایج (مرتب بر اساس پینگ). فایل همیشه ساخته می‌شود، حتی اگر خالی باشد.
     alive.sort(key=lambda c: c["tcp_ms"])
     with open(tcp_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(c["link"] for c in alive) + "\n")
+        if alive:
+            f.write("\n".join(c["link"] for c in alive) + "\n")
 
     log(f"\n🎉 تمام شد. TCP زنده: {len(alive)} از {len(uniq)}")
     log(f"📁 {tcp_path}")
