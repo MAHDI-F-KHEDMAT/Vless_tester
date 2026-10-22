@@ -1,0 +1,41 @@
+name: VLESS TCP check
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"   # هر ۳ ساعت (UTC)
+  workflow_dispatch:         # اجرای دستی
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vless-check
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run VLESS collector + TCP test
+        env:
+          VLESS_OUT_DIR: ${{ github.workspace }}
+        run: python vless_tester.py
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tcp_alive.txt
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "update tcp_alive.txt $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
