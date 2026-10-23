@@ -460,8 +460,17 @@ def run_batch(xray, batch, base, tmp):
             p.kill()
 
 
-def run_site_stage(alive):
+def save_final(good, path):
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        if good:
+            f.write("\n".join(c["link"] for c in sorted(good, key=lambda c: c["site_ms"])) + "\n")
+    os.replace(tmp_path, path)
+
+
+def run_site_stage(alive, final_path):
     xray = ensure_xray()
+    log(f"   xray: {xray}")
     tmp = tempfile.mkdtemp()
     batches = [alive[i:i + BATCH_SIZE] for i in range(0, len(alive), BATCH_SIZE)]
     slots = queue.Queue()
@@ -477,6 +486,7 @@ def run_site_stage(alive):
             slots.put(base)
         with lock:
             good.extend(res)
+            save_final(good, final_path)
             done["n"] += len(batch)
             log(f"   سایت‌تست: {done['n']}/{len(alive)}  سالم: {len(good)}")
 
@@ -543,15 +553,18 @@ def main():
     log(f"📁 {tcp_path}")
 
     # 5) تست gemini / youtube / x با xray
-    if XRAY_TEST and alive:
-        log(f"\n🌐 تست gemini / youtube / x روی {len(alive)} کانفیگ ...")
-        good = run_site_stage(alive)
-        good.sort(key=lambda c: c["site_ms"])
+    if XRAY_TEST:
         final_path = os.path.join(out_dir, FINAL_OUT_NAME)
-        with open(final_path, "w", encoding="utf-8") as f:
-            if good:
-                f.write("\n".join(c["link"] for c in good) + "\n")
-        log(f"✅ سالم در هر سه سایت: {len(good)} از {len(alive)}")
+        save_final([], final_path)   # فایل از همین اول ساخته می‌شود (حتی خالی)
+        if alive:
+            log(f"\n🌐 تست gemini / youtube / x روی {len(alive)} کانفیگ ...")
+            try:
+                good = run_site_stage(alive, final_path)
+                log(f"✅ سالم در هر سه سایت: {len(good)} از {len(alive)}")
+            except Exception as e:
+                import traceback
+                log(f"❌ مرحله‌ی سایت‌تست خطا داد: {type(e).__name__}: {e}")
+                log(traceback.format_exc())
         log(f"📁 {final_path}")
 
 
