@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VLESS (tls / reality) collector + TCP tester for Termux and GitHub Actions.
+VLESS (tls / reality) collector + TCP tester + site tester (gemini/youtube/x)
+برای Termux و GitHub Actions.
 
 مراحل:
  1) دانلود کانفیگ‌ها از منابع
  2) فیلتر: فقط vless با security=tls یا reality
  3) حذف تکراری‌ها
- 4) تست TCP و حذف مرده‌ها
-    خروجی: tcp_alive.txt (مرتب بر اساس پینگ)
-      - Termux: در پوشه Download
-      - GitHub Actions: در ریشه‌ی repo
+ 4) تست TCP و حذف مرده‌ها            -> tcp_alive.txt
+ 5) تست واقعی با xray روی gemini، youtube و x
+    فقط کانفیگ‌هایی که هر سه رو باز کنن می‌مونن -> final_alive.txt
+
+خروجی:
+  - Termux: پوشه Download
+  - GitHub Actions: ریشه‌ی repo
 
 نصب در ترموکس:
     termux-setup-storage
-    pkg update && pkg install -y python ca-certificates
+    pkg update && pkg install -y python ca-certificates xray
     python vless_tester.py
 (پیشنهاد: قبل از اجرا   termux-wake-lock   بزن تا گوشی خوابش نبره)
 """
@@ -22,21 +26,38 @@ VLESS (tls / reality) collector + TCP tester for Termux and GitHub Actions.
 import base64
 import concurrent.futures as cf
 import html
+import json
 import os
+import platform
+import queue
 import re
+import shutil
 import socket
+import ssl
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
+import zipfile
 from urllib.parse import parse_qs, unquote, urlsplit
 
 # ----------------------------- تنظیمات -----------------------------
 FETCH_TIMEOUT = 25          # ثانیه، دانلود هر منبع
 TCP_TIMEOUT = 3.0           # ثانیه
-TCP_ATTEMPTS = 10           # تعداد دفعات تست TCP برای هر کانفیگ (یک شکست = حذف)
+TCP_ATTEMPTS = 3            # تعداد دفعات تست TCP (یک شکست = حذف). چون تست واقعی داریم، کم شد
 TCP_WORKERS = 500           # اگر خطای Too many open files دیدی کمترش کن (مثلاً 250)
 TCP_OUT_NAME = "tcp_alive.txt"
+
+XRAY_TEST = True            # تست gemini/youtube/x
+FINAL_OUT_NAME = "final_alive.txt"
+XRAY_PROCS = max(2, os.cpu_count() or 2)   # تعداد پروسه‌ی xray موازی
+BATCH_SIZE = 300            # کانفیگ در هر پروسه‌ی xray
+TEST_WORKERS = 80           # ترد تست در هر دسته
+BASE_PORT = 20000
+SITE_TIMEOUT = 8            # ثانیه برای هر سایت
+SITE_TRIES = 2              # هر سایت تا این تعداد بار تلاش می‌شود
 
 URLS = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
@@ -205,6 +226,266 @@ def tcp_test(c):
     return c
 
 
+# ----------------------------- تست واقعی با xray -----------------------------
+CTX = ssl.create_default_context()
+BAD_GEMINI = ("isn't available in your", "not available in your country",
+              "isn\u2019t available in your", "isn't supported in your",
+              "isn\u2019t supported in your", "not supported in your")
+
+
+def ensure_xray():
+    p = shutil.which("xray")          # در ترموکس: pkg install xray
+    if p:
+        return p
+    d = os.path.join(tempfile.gettempdir(), "xray_bin")
+    local = os.path.join(d, "xray")
+    if os.path.isfile(local):
+        return local
+    os.makedirs(d, exist_ok=True)
+    m = platform.machine().lower()
+    name = "Xray-linux-arm64-v8a.zip" if m in ("aarch64", "arm64") else "Xray-linux-64.zip"
+    url = f"https://github.com/XTLS/Xray-core/releases/latest/download/{name}"
+    zp = os.path.join(d, name)
+    log(f"⬇️  دانلود xray: {name}")
+    urllib.request.urlretrieve(url, zp)
+    with zipfile.ZipFile(zp) as z:
+        z.extract("xray", d)
+    os.chmod(local, 0o755)
+    return local
+
+
+def build_outbound(c, tag):
+    q, net, sec = c["q"], c["net"], c["sec"]
+    user = {"id": c["uuid"], "encryption": q.get("encryption") or "none"}
+    if q.get("flow"):
+        user["flow"] = q["flow"]
+    sni = q.get("sni") or q.get("host") or c["host"]
+    ss = {"network": net, "security": sec}
+
+    if sec == "tls":
+        t = {"serverName": sni, "fingerprint": q.get("fp") or "chrome"}
+        if q.get("alpn"):
+            t["alpn"] = q["alpn"].split(",")
+        ss["tlsSettings"] = t
+    else:
+        ss["realitySettings"] = {
+            "serverName": sni, "fingerprint": q.get("fp") or "chrome",
+            "publicKey": q["pbk"], "shortId": q.get("sid", ""),
+            "spiderX": q.get("spx", ""),
+        }
+
+    path, host = q.get("path", "/"), q.get("host", "")
+    if net == "tcp" and q.get("headerType") == "http":
+        hdr = {"type": "http", "request": {"path": [path]}}
+        if host:
+            hdr["request"]["headers"] = {"Host": host.split(",")}
+        ss["tcpSettings"] = {"header": hdr}
+    elif net == "ws":
+        w = {"path": path}
+        if host:
+            w["headers"] = {"Host": host}
+        ss["wsSettings"] = w
+    elif net == "grpc":
+        g = {"serviceName": q.get("serviceName", ""), "multiMode": q.get("mode") == "multi"}
+        if q.get("authority"):
+            g["authority"] = q["authority"]
+        ss["grpcSettings"] = g
+    elif net == "httpupgrade":
+        ss["httpupgradeSettings"] = {"path": path, "host": host}
+    elif net == "xhttp":
+        x = {"path": path, "host": host, "mode": q.get("mode") or "auto"}
+        if q.get("extra"):
+            try:
+                x["extra"] = json.loads(q["extra"])
+            except Exception:
+                pass
+        ss["xhttpSettings"] = x
+
+    return {"tag": tag, "protocol": "vless",
+            "settings": {"vnext": [{"address": c["host"], "port": c["port"], "users": [user]}]},
+            "streamSettings": ss}
+
+
+def build_config(batch, base):
+    inb, outb, rules = [], [], []
+    for i, c in enumerate(batch):
+        inb.append({"tag": f"i{i}", "listen": "127.0.0.1", "port": base + i,
+                    "protocol": "socks", "settings": {"auth": "noauth", "udp": False}})
+        outb.append(build_outbound(c, f"o{i}"))
+        rules.append({"type": "field", "inboundTag": [f"i{i}"], "outboundTag": f"o{i}"})
+    return {"log": {"loglevel": "none"}, "inbounds": inb, "outbounds": outb,
+            "routing": {"domainStrategy": "AsIs", "rules": rules}}
+
+
+def start_xray(xray, batch, base, tmp):
+    cfg = os.path.join(tmp, f"c{base}_{len(batch)}_{time.time_ns()}.json")
+    with open(cfg, "w") as f:
+        json.dump(build_config(batch, base), f)
+    p = subprocess.Popen([xray, "run", "-c", cfg],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    last = base + len(batch) - 1
+    end = time.time() + 20
+    while time.time() < end:
+        if p.poll() is not None:
+            return None
+        try:
+            socket.create_connection(("127.0.0.1", last), timeout=0.3).close()
+            return p
+        except OSError:
+            time.sleep(0.1)
+    p.kill()
+    return None
+
+
+# --- چکرها ---
+def chk_gemini(st, loc, body):
+    if st == 200:
+        b = body.lower()
+        return not any(m in b for m in BAD_GEMINI)
+    if 300 <= st < 400:  # ریدایرکت به لاگین گوگل = منطقه‌ی پشتیبانی‌شده
+        l = loc.lower()
+        return "accounts.google.com" in l or "servicelogin" in l
+    return False
+
+
+def chk_ok(st, loc, body):
+    return 200 <= st < 400
+
+
+SITES = [  # gemini اول، چون شرط اصلیه و زودتر کانفیگ‌های بد رو حذف می‌کنه
+    ("gemini", "gemini.google.com", "/app", chk_gemini),
+    ("youtube", "www.youtube.com", "/generate_204", chk_ok),
+    ("x", "x.com", "/", chk_ok),
+]
+
+
+def _recvn(s, n):
+    b = b""
+    while len(b) < n:
+        d = s.recv(n - len(b))
+        if not d:
+            raise OSError("closed")
+        b += d
+    return b
+
+
+def http_check(port, host, path, check):
+    s = None
+    try:
+        end = time.time() + SITE_TIMEOUT
+        s = socket.create_connection(("127.0.0.1", port), timeout=SITE_TIMEOUT)
+        s.settimeout(SITE_TIMEOUT)
+        s.sendall(b"\x05\x01\x00")
+        if _recvn(s, 2) != b"\x05\x00":
+            return False
+        h = host.encode()
+        s.sendall(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + (443).to_bytes(2, "big"))
+        r = _recvn(s, 4)
+        if r[1] != 0:
+            return False
+        if r[3] == 1:
+            _recvn(s, 6)
+        elif r[3] == 4:
+            _recvn(s, 18)
+        else:
+            _recvn(s, _recvn(s, 1)[0] + 2)
+        s = CTX.wrap_socket(s, server_hostname=host)
+        s.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+                   f"User-Agent: {UA['User-Agent']}\r\nAccept: */*\r\n"
+                   f"Connection: close\r\n\r\n").encode())
+        buf = b""
+        while len(buf) < 16000:
+            left = end - time.time()
+            if left <= 0:
+                break
+            s.settimeout(left)
+            try:
+                d = s.recv(8192)
+            except socket.timeout:
+                break
+            if not d:
+                break
+            buf += d
+        head, _, body = buf.partition(b"\r\n\r\n")
+        if not head.startswith(b"HTTP/"):
+            return False
+        st = int(head.split(b" ", 2)[1])
+        m = re.search(rb"(?im)^location:\s*(.+)$", head)
+        loc = m.group(1).decode("utf-8", "ignore").strip() if m else ""
+        return check(st, loc, body.decode("utf-8", "ignore"))
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def site_test(c, port):
+    total = 0.0
+    for _name, host, path, check in SITES:
+        ok = False
+        for _ in range(SITE_TRIES):
+            t = time.time()
+            if http_check(port, host, path, check):
+                total += time.time() - t
+                ok = True
+                break
+        if not ok:
+            return None
+    c["site_ms"] = int(total * 1000)
+    return c
+
+
+def run_batch(xray, batch, base, tmp):
+    if not batch:
+        return []
+    p = start_xray(xray, batch, base, tmp)
+    if p is None:  # یک کانفیگ خراب کل دسته رو می‌اندازد → نصف‌کردن تا پیدا شود
+        if len(batch) == 1:
+            return []
+        mid = len(batch) // 2
+        return (run_batch(xray, batch[:mid], base, tmp) +
+                run_batch(xray, batch[mid:], base + mid, tmp))
+    try:
+        with cf.ThreadPoolExecutor(TEST_WORKERS) as ex:
+            res = list(ex.map(lambda ic: site_test(ic[1], base + ic[0]), enumerate(batch)))
+        return [r for r in res if r]
+    finally:
+        p.terminate()
+        try:
+            p.wait(5)
+        except Exception:
+            p.kill()
+
+
+def run_site_stage(alive):
+    xray = ensure_xray()
+    tmp = tempfile.mkdtemp()
+    batches = [alive[i:i + BATCH_SIZE] for i in range(0, len(alive), BATCH_SIZE)]
+    slots = queue.Queue()
+    for k in range(XRAY_PROCS):
+        slots.put(BASE_PORT + k * BATCH_SIZE)
+    good, lock, done = [], threading.Lock(), {"n": 0}
+
+    def job(batch):
+        base = slots.get()
+        try:
+            res = run_batch(xray, batch, base, tmp)
+        finally:
+            slots.put(base)
+        with lock:
+            good.extend(res)
+            done["n"] += len(batch)
+            log(f"   سایت‌تست: {done['n']}/{len(alive)}  سالم: {len(good)}")
+
+    with cf.ThreadPoolExecutor(XRAY_PROCS) as ex:
+        list(ex.map(job, batches))
+    shutil.rmtree(tmp, ignore_errors=True)
+    return good
+
+
 # ----------------------------- اصلی -----------------------------
 def main():
     out_dir = download_dir()
@@ -252,14 +533,26 @@ def main():
     with cf.ThreadPoolExecutor(TCP_WORKERS) as tp:
         list(tp.map(tcp_job, uniq))
 
-    # ذخیره نتایج (مرتب بر اساس پینگ). فایل همیشه ساخته می‌شود، حتی اگر خالی باشد.
+    # ذخیره نتایج TCP (مرتب بر اساس پینگ). فایل همیشه ساخته می‌شود.
     alive.sort(key=lambda c: c["tcp_ms"])
     with open(tcp_path, "w", encoding="utf-8") as f:
         if alive:
             f.write("\n".join(c["link"] for c in alive) + "\n")
 
-    log(f"\n🎉 تمام شد. TCP زنده: {len(alive)} از {len(uniq)}")
+    log(f"\n🎉 TCP زنده: {len(alive)} از {len(uniq)}")
     log(f"📁 {tcp_path}")
+
+    # 5) تست gemini / youtube / x با xray
+    if XRAY_TEST and alive:
+        log(f"\n🌐 تست gemini / youtube / x روی {len(alive)} کانفیگ ...")
+        good = run_site_stage(alive)
+        good.sort(key=lambda c: c["site_ms"])
+        final_path = os.path.join(out_dir, FINAL_OUT_NAME)
+        with open(final_path, "w", encoding="utf-8") as f:
+            if good:
+                f.write("\n".join(c["link"] for c in good) + "\n")
+        log(f"✅ سالم در هر سه سایت: {len(good)} از {len(alive)}")
+        log(f"📁 {final_path}")
 
 
 if __name__ == "__main__":
