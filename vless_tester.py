@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VLESS (tls / reality) collector + TCP tester + site tester (gemini/youtube/x)
+VLESS (tls / reality) collector + TCP tester + xray tester
 برای Termux و GitHub Actions.
 
 مراحل:
@@ -9,8 +9,8 @@ VLESS (tls / reality) collector + TCP tester + site tester (gemini/youtube/x)
  2) فیلتر: فقط vless با security=tls یا reality
  3) حذف تکراری‌ها
  4) تست TCP و حذف مرده‌ها (بدون ذخیره فایل)
- 5) تست واقعی با xray روی gemini، youtube و x
-    فقط کانفیگ‌هایی که هر سه رو باز کنن می‌مونن -> final_alive.txt
+ 5) تست واقعی با xray (یک درخواست HTTPS از داخل پروکسی)
+    فقط کانفیگ‌هایی که جواب بدن می‌مونن -> final_alive.txt
 
 خروجی:
   - Termux: پوشه Download
@@ -33,7 +33,6 @@ import queue
 import re
 import shutil
 import socket
-import ssl
 import subprocess
 import sys
 import tempfile
@@ -43,20 +42,25 @@ import urllib.request
 import zipfile
 from urllib.parse import parse_qs, unquote, urlsplit
 
-# ----------------------------- تنظیمات -----------------------------
-FETCH_TIMEOUT = 25          # ثانیه، دانلود هر منبع
-TCP_TIMEOUT = 2.0           # ثانیه
-TCP_ATTEMPTS = 2            # تعداد دفعات تست TCP (یک شکست = حذف). چون تست واقعی داریم، کم است
-TCP_WORKERS = 500           # اگر خطای Too many open files دیدی کمترش کن (مثلاً 250)
+try:
+    import resource
+except ImportError:  # ویندوز
+    resource = None
 
-XRAY_TEST = True            # تست gemini/youtube/x
+# ----------------------------- تنظیمات -----------------------------
+FETCH_TIMEOUT = 15          # ثانیه، دانلود هر منبع
+TCP_TIMEOUT = 2.0           # ثانیه
+TCP_ATTEMPTS = 1            # تعداد دفعات تست TCP (فقط پیش‌فیلتر؛ تست اصلی با xray انجام می‌شود)
+TCP_WORKERS = 1000          # خودکار با محدودیت فایل‌های باز سیستم هماهنگ می‌شود
+
+XRAY_TEST = True            # تست واقعی با xray
 FINAL_OUT_NAME = "final_alive.txt"
 XRAY_PROCS = max(4, (os.cpu_count() or 2) * 2)   # تعداد پروسه‌ی xray موازی (کارشون I/O هست)
 BATCH_SIZE = 300            # کانفیگ در هر پروسه‌ی xray
-TEST_WORKERS = 150          # ترد تست در هر دسته
+TEST_WORKERS = 300          # ترد تست در هر دسته (هم‌اندازه‌ی دسته = کل دسته هم‌زمان)
 BASE_PORT = 20000
-SITE_TIMEOUT = 6            # ثانیه برای هر سایت
-SITE_TRIES = 1              # هر سایت تا این تعداد بار تلاش می‌شود (برای دقت بیشتر 2 بذار)
+SITE_TIMEOUT = 4            # ثانیه برای تست xray
+SITE_TRIES = 1              # تعداد تلاش برای تست (برای دقت بیشتر 2 بذار)
 
 URLS = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
@@ -122,6 +126,24 @@ print_lock = threading.Lock()
 def log(*a):
     with print_lock:
         print(*a, flush=True)
+
+
+def tune_limits():
+    """محدودیت فایل‌های باز رو بالا می‌بره و تعداد ترد‌ها رو باهاش هماهنگ می‌کنه."""
+    global TCP_WORKERS, TEST_WORKERS
+    threading.stack_size(512 * 1024)   # رم کمتر برای هزاران ترد
+    fd = 1024
+    if resource:
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            want = 65535 if hard == resource.RLIM_INFINITY else min(hard, 65535)
+            if soft < want:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            fd = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        except Exception:
+            pass
+    TCP_WORKERS = min(TCP_WORKERS, max(50, fd // 4))
+    TEST_WORKERS = min(TEST_WORKERS, max(20, fd // (3 * XRAY_PROCS)))
 
 
 # ----------------------------- مسیر خروجی -----------------------------
@@ -225,12 +247,6 @@ def tcp_ping(host, port):
 
 
 # ----------------------------- تست واقعی با xray -----------------------------
-CTX = ssl.create_default_context()
-BAD_GEMINI = ("isn't available in your", "not available in your country",
-              "isn\u2019t available in your", "isn't supported in your",
-              "isn\u2019t supported in your", "not supported in your")
-
-
 def ensure_xray():
     p = shutil.which("xray")          # در ترموکس: pkg install xray
     if p:
@@ -335,26 +351,13 @@ def start_xray(xray, batch, base, tmp):
     return None
 
 
-# --- چکرها ---
-def chk_gemini(st, loc, body):
-    if st == 200:
-        b = body.lower()
-        return not any(m in b for m in BAD_GEMINI)
-    if 300 <= st < 400:  # ریدایرکت به لاگین گوگل = منطقه‌ی پشتیبانی‌شده
-        l = loc.lower()
-        return "accounts.google.com" in l or "servicelogin" in l
-    return False
-
-
+# --- چکر ---
 def chk_ok(st, loc, body):
     return 200 <= st < 400
 
 
-SITES = [  # gemini اول، چون شرط اصلیه و زودتر کانفیگ‌های بد رو حذف می‌کنه
-    ("gemini", "gemini.google.com", "/app", chk_gemini),
-    ("youtube", "www.youtube.com", "/generate_204", chk_ok),
-    ("x", "x.com", "/", chk_ok),
-]
+# تست ساده‌ی اتصال از داخل پروکسی. HTTP ساده روی پورت 80 (بدون TLS در پایتون = CPU کمتر)
+TEST_HOST, TEST_PORT, TEST_PATH = "cp.cloudflare.com", 80, "/generate_204"
 
 
 def _recvn(s, n):
@@ -367,7 +370,7 @@ def _recvn(s, n):
     return b
 
 
-def http_check(port, host, path, check):
+def http_check(port):
     s = None
     try:
         end = time.time() + SITE_TIMEOUT
@@ -376,8 +379,8 @@ def http_check(port, host, path, check):
         s.sendall(b"\x05\x01\x00")
         if _recvn(s, 2) != b"\x05\x00":
             return False
-        h = host.encode()
-        s.sendall(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + (443).to_bytes(2, "big"))
+        h = TEST_HOST.encode()
+        s.sendall(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + TEST_PORT.to_bytes(2, "big"))
         r = _recvn(s, 4)
         if r[1] != 0:
             return False
@@ -387,30 +390,23 @@ def http_check(port, host, path, check):
             _recvn(s, 18)
         else:
             _recvn(s, _recvn(s, 1)[0] + 2)
-        s = CTX.wrap_socket(s, server_hostname=host)
-        s.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+        s.sendall((f"GET {TEST_PATH} HTTP/1.1\r\nHost: {TEST_HOST}\r\n"
                    f"User-Agent: {UA['User-Agent']}\r\nAccept: */*\r\n"
                    f"Connection: close\r\n\r\n").encode())
         buf = b""
-        while len(buf) < 16000:
+        while b"\r\n\r\n" not in buf and len(buf) < 8192:   # به محض رسیدن هدر تمام
             left = end - time.time()
             if left <= 0:
-                break
+                return False
             s.settimeout(left)
-            try:
-                d = s.recv(8192)
-            except socket.timeout:
-                break
+            d = s.recv(2048)
             if not d:
                 break
             buf += d
-        head, _, body = buf.partition(b"\r\n\r\n")
-        if not head.startswith(b"HTTP/"):
+        if not buf.startswith(b"HTTP/"):
             return False
-        st = int(head.split(b" ", 2)[1])
-        m = re.search(rb"(?im)^location:\s*(.+)$", head)
-        loc = m.group(1).decode("utf-8", "ignore").strip() if m else ""
-        return check(st, loc, body.decode("utf-8", "ignore"))
+        st = int(buf.split(b" ", 2)[1])
+        return chk_ok(st, "", "")
     except Exception:
         return False
     finally:
@@ -420,20 +416,13 @@ def http_check(port, host, path, check):
             pass
 
 
-def site_test(c, port):
-    total = 0.0
-    for _name, host, path, check in SITES:
-        ok = False
-        for _ in range(SITE_TRIES):
-            t = time.time()
-            if http_check(port, host, path, check):
-                total += time.time() - t
-                ok = True
-                break
-        if not ok:
-            return None
-    c["site_ms"] = int(total * 1000)
-    return c
+def site_test(c, port):  # تست ساده‌ی اتصال
+    for _ in range(SITE_TRIES):
+        t = time.time()
+        if http_check(port):
+            c["site_ms"] = int((time.time() - t) * 1000)
+            return c
+    return None
 
 
 def run_batch(xray, batch, base, tmp):
@@ -447,7 +436,7 @@ def run_batch(xray, batch, base, tmp):
         return (run_batch(xray, batch[:mid], base, tmp) +
                 run_batch(xray, batch[mid:], base + mid, tmp))
     try:
-        with cf.ThreadPoolExecutor(TEST_WORKERS) as ex:
+        with cf.ThreadPoolExecutor(min(TEST_WORKERS, len(batch))) as ex:
             res = list(ex.map(lambda ic: site_test(ic[1], base + ic[0]), enumerate(batch)))
         return [r for r in res if r]
     finally:
@@ -466,38 +455,78 @@ def save_final(good, path):
     os.replace(tmp_path, path)
 
 
-def run_site_stage(alive, final_path):
-    xray = ensure_xray()
-    log(f"   xray: {xray}")
-    tmp = tempfile.mkdtemp()
-    batches = [alive[i:i + BATCH_SIZE] for i in range(0, len(alive), BATCH_SIZE)]
-    slots = queue.Queue()
-    for k in range(XRAY_PROCS):
-        slots.put(BASE_PORT + k * BATCH_SIZE)
-    good, lock, done = [], threading.Lock(), {"n": 0}
+class SiteStage:
+    """تست xray به‌صورت پایپ‌لاین: هر ۳۰۰ کانفیگ زنده‌ی TCP بلافاصله وارد تست xray می‌شه،
+    بدون اینکه منتظر تموم‌شدن تست TCP بقیه بمونه."""
 
-    def job(batch):
-        base = slots.get()
+    def __init__(self, final_path):
+        self.final_path = final_path
+        self.xray = ensure_xray()
+        self.tmp = tempfile.mkdtemp()
+        self.slots = queue.Queue()
+        for k in range(XRAY_PROCS):
+            self.slots.put(BASE_PORT + k * BATCH_SIZE)
+        self.ex = cf.ThreadPoolExecutor(XRAY_PROCS)
+        self.futs, self.pending, self.good = [], [], []
+        self.plock, self.lock = threading.Lock(), threading.Lock()
+        self.queued = 0
+        self.tested = 0
+
+    def _submit(self, batch):
+        self.queued += len(batch)
+        self.futs.append(self.ex.submit(self._job, batch))
+
+    def add(self, cs):
+        with self.plock:
+            self.pending.extend(cs)
+            while len(self.pending) >= BATCH_SIZE:
+                batch, self.pending = self.pending[:BATCH_SIZE], self.pending[BATCH_SIZE:]
+                self._submit(batch)
+
+    def _job(self, batch):
+        base = self.slots.get()
         try:
-            res = run_batch(xray, batch, base, tmp)
+            res = run_batch(self.xray, batch, base, self.tmp)
+        except Exception as e:
+            log(f"   ⚠️ خطا در یک دسته: {type(e).__name__}: {e}")
+            res = []
         finally:
-            slots.put(base)
-        with lock:
-            good.extend(res)
-            save_final(good, final_path)
-            done["n"] += len(batch)
-            log(f"   سایت‌تست: {done['n']}/{len(alive)}  سالم: {len(good)}")
+            self.slots.put(base)
+        with self.lock:
+            self.good.extend(res)
+            self.tested += len(batch)
+            if res:
+                save_final(self.good, self.final_path)
+            log(f"   xray: {self.tested}/{self.queued} تست‌شده  سالم: {len(self.good)}")
 
-    with cf.ThreadPoolExecutor(XRAY_PROCS) as ex:
-        list(ex.map(job, batches))
-    shutil.rmtree(tmp, ignore_errors=True)
-    return good
+    def finish(self):
+        with self.plock:
+            if self.pending:
+                batch, self.pending = self.pending, []
+                self._submit(batch)
+        for f in list(self.futs):
+            f.result()
+        self.ex.shutdown()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        return self.good
 
 
 # ----------------------------- اصلی -----------------------------
 def main():
+    tune_limits()
     out_dir = download_dir()
     final_path = os.path.join(out_dir, FINAL_OUT_NAME)
+    save_final([], final_path)   # فایل از همین اول ساخته می‌شود (حتی خالی)
+
+    # آماده‌سازی xray قبل از همه (اگه مشکل داشت زود بفهمیم)
+    stage = None
+    if XRAY_TEST:
+        try:
+            stage = SiteStage(final_path)
+        except Exception as e:
+            import traceback
+            log(f"❌ آماده‌سازی xray خطا داد: {type(e).__name__}: {e}")
+            log(traceback.format_exc())
 
     # 1) دانلود
     log(f"⬇️  دانلود از {len(URLS)} منبع ...")
@@ -523,49 +552,44 @@ def main():
         uniq.append(c)
     log(f"🔎 tls/reality یکتا: {len(uniq)}")
 
-    # 4) تست TCP: کانفیگ‌هایی که host:port مشترک دارن فقط یک بار تست می‌شن
+    # 4) تست TCP (هر host:port یک بار) + همزمان تحویل به تست xray
     groups = {}
     for c in uniq:
         groups.setdefault((c["host"].lower(), c["port"]), []).append(c)
-    log(f"📡 تست TCP روی {len(groups)} مقصد یکتا ({len(uniq)} کانفیگ) ...")
-    alive = []
+    log(f"📡 تست TCP روی {len(groups)} مقصد یکتا ({len(uniq)} کانفیگ) | ورکر: {TCP_WORKERS}")
+    collected = []
     lock = threading.Lock()
-    done = {"n": 0}
+    st = {"n": 0, "alive": 0}
 
     def tcp_job(item):
         (host, port), cs = item
         ms = tcp_ping(host, port)
+        if ms is not None:
+            for c in cs:
+                c["tcp_ms"] = ms
+            if stage:
+                stage.add(cs)
         with lock:
-            done["n"] += 1
+            st["n"] += 1
             if ms is not None:
-                for c in cs:
-                    c["tcp_ms"] = ms
-                alive.extend(cs)
-            if done["n"] % 1000 == 0:
-                log(f"   TCP: {done['n']}/{len(groups)}  کانفیگ زنده: {len(alive)}")
+                st["alive"] += len(cs)
+                if not XRAY_TEST:
+                    collected.extend(cs)
+            if st["n"] % 2000 == 0:
+                log(f"   TCP: {st['n']}/{len(groups)}  کانفیگ زنده: {st['alive']}")
 
     with cf.ThreadPoolExecutor(min(TCP_WORKERS, len(groups) or 1)) as tp:
         list(tp.map(tcp_job, groups.items()))
+    log(f"🎉 TCP زنده: {st['alive']} از {len(uniq)}")
 
-    alive.sort(key=lambda c: c["tcp_ms"])
-    log(f"\n🎉 TCP زنده: {len(alive)} از {len(uniq)}")
-
-    # 5) تست gemini / youtube / x با xray -> فقط final_alive.txt
-    save_final([], final_path)   # فایل از همین اول ساخته می‌شود (حتی خالی)
-    if XRAY_TEST:
-        if alive:
-            log(f"\n🌐 تست gemini / youtube / x روی {len(alive)} کانفیگ ...")
-            try:
-                good = run_site_stage(alive, final_path)
-                log(f"✅ سالم در هر سه سایت: {len(good)} از {len(alive)}")
-            except Exception as e:
-                import traceback
-                log(f"❌ مرحله‌ی سایت‌تست خطا داد: {type(e).__name__}: {e}")
-                log(traceback.format_exc())
-    else:
-        for c in alive:
+    # 5) پایان تست xray
+    if stage:
+        good = stage.finish()
+        log(f"✅ سالم: {len(good)} از {st['alive']}")
+    elif not XRAY_TEST:
+        for c in collected:
             c["site_ms"] = c["tcp_ms"]
-        save_final(alive, final_path)
+        save_final(collected, final_path)
     log(f"📁 {final_path}")
 
 
