@@ -45,18 +45,18 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 # ----------------------------- تنظیمات -----------------------------
 FETCH_TIMEOUT = 25          # ثانیه، دانلود هر منبع
-TCP_TIMEOUT = 3.0           # ثانیه
-TCP_ATTEMPTS = 3            # تعداد دفعات تست TCP (یک شکست = حذف). چون تست واقعی داریم، کم شد
+TCP_TIMEOUT = 2.0           # ثانیه
+TCP_ATTEMPTS = 2            # تعداد دفعات تست TCP (یک شکست = حذف). چون تست واقعی داریم، کم است
 TCP_WORKERS = 500           # اگر خطای Too many open files دیدی کمترش کن (مثلاً 250)
 
 XRAY_TEST = True            # تست gemini/youtube/x
 FINAL_OUT_NAME = "final_alive.txt"
-XRAY_PROCS = max(2, os.cpu_count() or 2)   # تعداد پروسه‌ی xray موازی
+XRAY_PROCS = max(4, (os.cpu_count() or 2) * 2)   # تعداد پروسه‌ی xray موازی (کارشون I/O هست)
 BATCH_SIZE = 300            # کانفیگ در هر پروسه‌ی xray
-TEST_WORKERS = 80           # ترد تست در هر دسته
+TEST_WORKERS = 150          # ترد تست در هر دسته
 BASE_PORT = 20000
-SITE_TIMEOUT = 8            # ثانیه برای هر سایت
-SITE_TRIES = 2              # هر سایت تا این تعداد بار تلاش می‌شود
+SITE_TIMEOUT = 6            # ثانیه برای هر سایت
+SITE_TRIES = 1              # هر سایت تا این تعداد بار تلاش می‌شود (برای دقت بیشتر 2 بذار)
 
 URLS = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
@@ -211,18 +211,17 @@ def dedup_key(c):
 
 
 # ----------------------------- تست TCP -----------------------------
-def tcp_test(c):
-    """TCP_ATTEMPTS بار تست می‌گیره؛ اگه حتی یک بار تایم‌اوت/خطا داد حذف می‌شه."""
+def tcp_ping(host, port):
+    """TCP_ATTEMPTS بار تست می‌گیره؛ با اولین شکست None برمی‌گردونه، وگرنه میانگین پینگ (ms)."""
     total = 0
     for _ in range(TCP_ATTEMPTS):
         t = time.time()
         try:
-            with socket.create_connection((c["host"], c["port"]), timeout=TCP_TIMEOUT):
+            with socket.create_connection((host, port), timeout=TCP_TIMEOUT):
                 total += time.time() - t
         except Exception:
-            return None  # با اولین شکست فوراً حذف
-    c["tcp_ms"] = int(total / TCP_ATTEMPTS * 1000)
-    return c
+            return None
+    return int(total / TCP_ATTEMPTS * 1000)
 
 
 # ----------------------------- تست واقعی با xray -----------------------------
@@ -524,23 +523,29 @@ def main():
         uniq.append(c)
     log(f"🔎 tls/reality یکتا: {len(uniq)}")
 
-    # 4) تست TCP
-    log(f"📡 تست TCP روی {len(uniq)} کانفیگ (ورکر: {TCP_WORKERS}) ...")
+    # 4) تست TCP: کانفیگ‌هایی که host:port مشترک دارن فقط یک بار تست می‌شن
+    groups = {}
+    for c in uniq:
+        groups.setdefault((c["host"].lower(), c["port"]), []).append(c)
+    log(f"📡 تست TCP روی {len(groups)} مقصد یکتا ({len(uniq)} کانفیگ) ...")
     alive = []
     lock = threading.Lock()
     done = {"n": 0}
 
-    def tcp_job(c):
-        r = tcp_test(c)
+    def tcp_job(item):
+        (host, port), cs = item
+        ms = tcp_ping(host, port)
         with lock:
             done["n"] += 1
-            if r:
-                alive.append(r)
+            if ms is not None:
+                for c in cs:
+                    c["tcp_ms"] = ms
+                alive.extend(cs)
             if done["n"] % 1000 == 0:
-                log(f"   TCP: {done['n']}/{len(uniq)}  زنده: {len(alive)}")
+                log(f"   TCP: {done['n']}/{len(groups)}  کانفیگ زنده: {len(alive)}")
 
-    with cf.ThreadPoolExecutor(TCP_WORKERS) as tp:
-        list(tp.map(tcp_job, uniq))
+    with cf.ThreadPoolExecutor(min(TCP_WORKERS, len(groups) or 1)) as tp:
+        list(tp.map(tcp_job, groups.items()))
 
     alive.sort(key=lambda c: c["tcp_ms"])
     log(f"\n🎉 TCP زنده: {len(alive)} از {len(uniq)}")
