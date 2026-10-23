@@ -8,7 +8,7 @@ VLESS (tls / reality) collector + TCP tester + site tester (gemini/youtube/x)
  1) دانلود کانفیگ‌ها از منابع
  2) فیلتر: فقط vless با security=tls یا reality
  3) حذف تکراری‌ها
- 4) تست TCP و حذف مرده‌ها            -> tcp_alive.txt
+ 4) تست TCP و حذف مرده‌ها (بدون ذخیره فایل)
  5) تست واقعی با xray روی gemini، youtube و x
     فقط کانفیگ‌هایی که هر سه رو باز کنن می‌مونن -> final_alive.txt
 
@@ -48,7 +48,6 @@ FETCH_TIMEOUT = 25          # ثانیه، دانلود هر منبع
 TCP_TIMEOUT = 3.0           # ثانیه
 TCP_ATTEMPTS = 3            # تعداد دفعات تست TCP (یک شکست = حذف). چون تست واقعی داریم، کم شد
 TCP_WORKERS = 500           # اگر خطای Too many open files دیدی کمترش کن (مثلاً 250)
-TCP_OUT_NAME = "tcp_alive.txt"
 
 XRAY_TEST = True            # تست gemini/youtube/x
 FINAL_OUT_NAME = "final_alive.txt"
@@ -499,7 +498,7 @@ def run_site_stage(alive, final_path):
 # ----------------------------- اصلی -----------------------------
 def main():
     out_dir = download_dir()
-    tcp_path = os.path.join(out_dir, TCP_OUT_NAME)
+    final_path = os.path.join(out_dir, FINAL_OUT_NAME)
 
     # 1) دانلود
     log(f"⬇️  دانلود از {len(URLS)} منبع ...")
@@ -543,19 +542,12 @@ def main():
     with cf.ThreadPoolExecutor(TCP_WORKERS) as tp:
         list(tp.map(tcp_job, uniq))
 
-    # ذخیره نتایج TCP (مرتب بر اساس پینگ). فایل همیشه ساخته می‌شود.
     alive.sort(key=lambda c: c["tcp_ms"])
-    with open(tcp_path, "w", encoding="utf-8") as f:
-        if alive:
-            f.write("\n".join(c["link"] for c in alive) + "\n")
-
     log(f"\n🎉 TCP زنده: {len(alive)} از {len(uniq)}")
-    log(f"📁 {tcp_path}")
 
-    # 5) تست gemini / youtube / x با xray
+    # 5) تست gemini / youtube / x با xray -> فقط final_alive.txt
+    save_final([], final_path)   # فایل از همین اول ساخته می‌شود (حتی خالی)
     if XRAY_TEST:
-        final_path = os.path.join(out_dir, FINAL_OUT_NAME)
-        save_final([], final_path)   # فایل از همین اول ساخته می‌شود (حتی خالی)
         if alive:
             log(f"\n🌐 تست gemini / youtube / x روی {len(alive)} کانفیگ ...")
             try:
@@ -565,7 +557,11 @@ def main():
                 import traceback
                 log(f"❌ مرحله‌ی سایت‌تست خطا داد: {type(e).__name__}: {e}")
                 log(traceback.format_exc())
-        log(f"📁 {final_path}")
+    else:
+        for c in alive:
+            c["site_ms"] = c["tcp_ms"]
+        save_final(alive, final_path)
+    log(f"📁 {final_path}")
 
 
 if __name__ == "__main__":
